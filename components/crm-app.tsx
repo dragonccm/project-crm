@@ -1,13 +1,13 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Call, Deal, initialCalls, initialDeals, initialLeads, Lead, owners, stages } from "@/lib/mock-data";
+import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import { Call, Deal, initialCalls, initialDeals, initialLeads, Lead, owners, reportData, SalesStats, stages, teams, unmetRequests } from "@/lib/mock-data";
 
 type Page = "overview" | "leads" | "pipeline" | "reports" | "calls" | "settings";
 type Modal = "lead" | "deal" | "call" | null;
 
 const pageNames: Record<Page, string> = {
-  overview: "Tổng quan", leads: "Khách hàng tiềm năng", pipeline: "Pipeline đơn hàng",
+  overview: "Tổng quan", leads: "Khách hàng tiềm năng", pipeline: "Tiến độ đơn hàng",
   reports: "Báo cáo", calls: "Tổng đài & cuộc gọi", settings: "Tích hợp API",
 };
 
@@ -45,6 +45,10 @@ export default function CrmApp() {
   const [callDirection, setCallDirection] = useState("");
   const [reportPeriod, setReportPeriod] = useState("Tháng này");
   const [reportTeam, setReportTeam] = useState("Toàn đội");
+  const [reportOwnerFilter, setReportOwnerFilter] = useState("");
+  const [draggedDeal, setDraggedDeal] = useState<string | null>(null);
+  const [dropStage, setDropStage] = useState<string | null>(null);
+  const importInput = useRef<HTMLInputElement>(null);
 
   const filteredLeads = useMemo(() => leads.filter((lead) => {
     const query = leadSearch.toLocaleLowerCase("vi");
@@ -56,6 +60,18 @@ export default function CrmApp() {
     return (!query || `${call.customer} ${call.phone}`.toLocaleLowerCase("vi").includes(query))
       && (!callOwner || call.owner === callOwner) && (!callDirection || call.direction === callDirection);
   }), [calls, callSearch, callOwner, callDirection]);
+  const reportOwners = useMemo(() => owners.filter((owner) => (reportTeam === "Toàn đội" || teams[owner] === reportTeam) && (!reportOwnerFilter || owner === reportOwnerFilter)), [reportTeam, reportOwnerFilter]);
+  const reportRows = useMemo(() => reportOwners.map((owner) => ({ owner, ...reportData[reportPeriod][owner] })), [reportOwners, reportPeriod]);
+  const reportTotals = useMemo(() => reportRows.reduce<SalesStats>((total, row) => ({
+    calls: total.calls + row.calls,
+    callMinutes: total.callMinutes + row.callMinutes,
+    leads: total.leads + row.leads,
+    completedOrders: total.completedOrders + row.completedOrders,
+    unmetRequests: total.unmetRequests + row.unmetRequests,
+    responseMinutes: total.responseMinutes + row.responseMinutes,
+    messageResponseRate: total.messageResponseRate + row.messageResponseRate,
+    answerRate: total.answerRate + row.answerRate,
+  }), { calls: 0, callMinutes: 0, leads: 0, completedOrders: 0, unmetRequests: 0, responseMinutes: 0, messageResponseRate: 0, answerRate: 0 }), [reportRows]);
 
   function notify(message: string) {
     setToastText(message);
@@ -67,9 +83,75 @@ export default function CrmApp() {
     setSelectedLead(null);
   }
 
-  function updateDeal(name: string, stage: string) {
-    setDeals((items) => items.map((deal) => deal.name === name ? { ...deal, stage } : deal));
-    notify(stage === "Đang chăm sóc" ? "Báo giá chưa được đồng ý — đã quay lại Đang chăm sóc" : `${name}: ${stage}`);
+  function leadStatusForStage(stageId: string) {
+    if (stageId === "care") return "Đang chăm sóc";
+    if (stageId === "quotation") return "Báo giá";
+    if (stageId === "accepted") return "Đồng ý";
+    return stages.find((stage) => stage.id === stageId)?.title || "Đang chăm sóc";
+  }
+
+  function updateDeal(name: string, stageId: string) {
+    setDeals((items) => items.map((deal) => deal.name === name ? { ...deal, stage: stageId, quoteRejected: false } : deal));
+    setLeads((items) => items.map((lead) => lead.company === name ? { ...lead, status: leadStatusForStage(stageId) } : lead));
+    notify(`${name}: ${stages.find((stage) => stage.id === stageId)?.title || stageId}`);
+  }
+
+  function rejectQuote(name: string) {
+    setDeals((items) => items.map((deal) => deal.name === name ? { ...deal, stage: "care", quoteRejected: true } : deal));
+    setLeads((items) => items.map((lead) => lead.company === name ? { ...lead, status: "Đang chăm sóc" } : lead));
+    notify("Khách chưa đồng ý báo giá — cơ hội quay lại Chăm sóc khách hàng");
+  }
+
+  function startDealDrag(event: DragEvent<HTMLElement>, deal: Deal) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", deal.name);
+    setDraggedDeal(deal.name);
+  }
+
+  function dropDeal(event: DragEvent<HTMLElement>, stageId: string) {
+    event.preventDefault();
+    const name = event.dataTransfer.getData("text/plain") || draggedDeal;
+    if (name) updateDeal(name, stageId);
+    setDraggedDeal(null);
+    setDropStage(null);
+  }
+
+  function parseCsvLine(line: string) {
+    return Array.from(line.matchAll(/(?:^|,)(?:"((?:[^"]|"")*)"|([^,]*))/g), (match) => (match[1] ?? match[2] ?? "").replace(/""/g, '"').trim());
+  }
+
+  function normalizeHeader(value: string) {
+    return value.trim().toLocaleLowerCase("vi").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+
+  async function importCsv(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const lines = (await file.text()).split(/\r?\n/).filter((line) => line.trim());
+    event.target.value = "";
+    if (lines.length < 2) return notify("CSV cần có hàng tiêu đề và ít nhất một khách hàng");
+    const headers = parseCsvLine(lines[0]).map(normalizeHeader);
+    const findColumn = (...names: string[]) => headers.findIndex((header) => names.includes(header));
+    const nameIndex = findColumn("name", "ten lien he", "ten khach hang", "contact name");
+    const companyIndex = findColumn("company", "cong ty", "doanh nghiep");
+    const phoneIndex = findColumn("phone", "so dien thoai", "dien thoai");
+    if (nameIndex < 0 || companyIndex < 0 || phoneIndex < 0) return notify("CSV cần các cột: name, company, phone");
+    const sourceIndex = findColumn("source", "nguon");
+    const ownerIndex = findColumn("owner", "sales", "nhan vien phu trach");
+    const needIndex = findColumn("need", "nhu cau");
+    const incoming = lines.slice(1).map(parseCsvLine).map((row): Lead | null => {
+      const name = row[nameIndex]?.trim();
+      const company = row[companyIndex]?.trim();
+      const phone = row[phoneIndex]?.trim();
+      if (!name || !company || !phone) return null;
+      const requestedOwner = ownerIndex >= 0 ? row[ownerIndex]?.trim() : "";
+      return { name, company, phone, source: (sourceIndex >= 0 && row[sourceIndex]) || "Import CSV", owner: owners.includes(requestedOwner) ? requestedOwner : owners[0], status: "Đang chăm sóc", last: "Vừa import", need: (needIndex >= 0 && row[needIndex]) || "Chưa cập nhật" };
+    }).filter((lead): lead is Lead => Boolean(lead));
+    const unique = incoming.filter((lead, index) => !leads.some((existing) => existing.phone === lead.phone) && incoming.findIndex((candidate) => candidate.phone === lead.phone) === index);
+    if (!unique.length) return notify("Không có dòng hợp lệ mới để import");
+    setLeads((items) => [...unique, ...items]);
+    setDeals((items) => [...unique.map((lead) => ({ name: lead.company, detail: `${lead.need} · Lead mới`, owner: lead.owner, stage: "care", value: 0 })), ...items]);
+    notify(`Đã import ${unique.length} khách hàng và đưa vào chăm sóc`);
   }
 
   function addLead(form: FormData) {
@@ -77,7 +159,12 @@ export default function CrmApp() {
     const company = String(form.get("company") || "").trim();
     const phone = String(form.get("phone") || "").trim();
     if (!name || !company || !phone) return notify("Vui lòng nhập tên, công ty và số điện thoại");
-    setLeads((items) => [{ name, company, phone, source: String(form.get("source")), owner: String(form.get("owner")), status: String(form.get("status")), last: "Vừa tạo", need: "Chưa cập nhật" }, ...items]);
+    const status = String(form.get("status"));
+    const owner = String(form.get("owner"));
+    const need = String(form.get("need") || "Chưa cập nhật");
+    const initialStage = status === "Báo giá" ? "quotation" : status === "Đồng ý" ? "accepted" : "care";
+    setLeads((items) => [{ name, company, phone, source: String(form.get("source")), owner, status, last: "Vừa tạo", need }, ...items]);
+    setDeals((items) => [{ name: company, detail: `${need} · Lead mới`, owner, stage: initialStage, value: 0 }, ...items]);
     setModal(null);
     notify("Đã tạo khách hàng và phân công sales");
   }
@@ -86,7 +173,9 @@ export default function CrmApp() {
     const name = String(form.get("name") || "").trim();
     const value = Number(form.get("value"));
     if (!name || !value) return notify("Vui lòng nhập khách hàng và giá trị đơn hàng");
-    setDeals((items) => [{ name, detail: "Cơ hội mới · Chưa xác định tuyến", value, owner: String(form.get("owner")), stage: String(form.get("stage")) }, ...items]);
+    const stage = String(form.get("stage"));
+    setDeals((items) => [{ name, detail: "Cơ hội mới · Chưa xác định tuyến", value, owner: String(form.get("owner")), stage }, ...items]);
+    setLeads((items) => items.map((lead) => lead.company === name ? { ...lead, owner: String(form.get("owner")), status: leadStatusForStage(stage) } : lead));
     setModal(null);
     notify("Đã tạo cơ hội bán hàng");
   }
@@ -138,7 +227,7 @@ export default function CrmApp() {
         </div>
         <div className="grid overview-grid">
           <article className="panel"><PanelHead title="Pipeline bán hàng" subtitle="Cơ hội đang mở theo giai đoạn" action={<button className="link" onClick={() => goTo("pipeline")}>Mở pipeline →</button>} />
-            <div className="funnel">{["Đang chăm sóc", "Báo giá", "Đồng ý", "Booking", "Giao hàng"].map((stage, index) => { const count = deals.filter((deal) => deal.stage === stage).length + [17, 8, 6, 4, 3][index]; return <div className="funnel-row" key={stage}><span>{stage}</span><div className="bar-track"><div className="bar" style={{ width: `${Math.round(count / 19 * 100)}%` }} /></div><b>{count}</b></div>; })}</div>
+            <div className="funnel">{[{ id: "care", title: "Chăm sóc khách hàng" }, { id: "quotation", title: "Gửi báo giá" }, { id: "accepted", title: "Khách hàng đồng ý" }, { id: "booking", title: "Đặt booking" }, { id: "delivery", title: "Giao hàng" }].map((stage, index) => { const count = deals.filter((deal) => deal.stage === stage.id).length + [17, 8, 6, 4, 3][index]; return <div className="funnel-row" key={stage.id}><span>{stage.title}</span><div className="bar-track"><div className="bar" style={{ width: `${Math.round(count / 19 * 100)}%` }} /></div><b>{count}</b></div>; })}</div>
           </article>
           <article className="panel"><PanelHead title="Hoạt động gần đây" subtitle="Cập nhật mới nhất" action={<button className="link" onClick={() => goTo("calls")}>Tất cả →</button>} />
             <div className="activity"><Activity icon="☎" title="Anh Nguyễn gọi Sakura Trading" body="Đã trao đổi báo giá tuyến Nhật" time="10:24" /><Activity icon="▣" title="Hà Phạm cập nhật Orchid Home" body="Cơ hội chuyển sang Đồng ý" time="09:42" /><Activity icon="＋" title="Lead mới từ tổng đài" body="Blue Ocean Co. · Linh Võ phụ trách" time="09:16" /></div>
@@ -150,25 +239,41 @@ export default function CrmApp() {
       </>}
 
       {page === "leads" && <>
-        <PageHead eyebrow="Quản lý khách hàng" title="Khách hàng tiềm năng" description="Theo dõi nguồn, người phụ trách và lịch sử chăm sóc." action={<><Button onClick={() => notify("Import CSV sẽ được kết nối ở phiên bản backend")}>⇧ Import CSV</Button><Button primary onClick={() => setModal("lead")}>＋ Thêm khách hàng</Button></>} />
+        <PageHead eyebrow="Quản lý khách hàng" title="Khách hàng tiềm năng" description="Theo dõi nguồn, người phụ trách và lịch sử chăm sóc." action={<><Button onClick={() => importInput.current?.click()}>⇧ Import CSV</Button><input ref={importInput} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={importCsv} /><Button primary onClick={() => setModal("lead")}>＋ Thêm khách hàng</Button></>} />
         <div className="metrics"><Metric label="Tổng khách hàng" value={String(248 + leads.length - 12)} note="Tất cả nguồn" /><Metric label="Lead mới tháng này" value="42" note="↗ 16% so tháng trước" /><Metric label="Chưa được liên hệ" value="8" note="Cần xử lý hôm nay" /><Metric label="Tỷ lệ chuyển đổi" value="18.6%" note="↗ 3.2% so tháng trước" /></div>
-        <div className="filters"><input aria-label="Tìm khách hàng" value={leadSearch} onChange={(event) => setLeadSearch(event.target.value)} placeholder="Tìm tên, công ty, số điện thoại" /><select aria-label="Lọc theo sales" value={leadOwner} onChange={(event) => setLeadOwner(event.target.value)}><option value="">Tất cả sales</option>{owners.map((owner) => <option key={owner}>{owner}</option>)}</select><select aria-label="Lọc theo giai đoạn" value={leadStatus} onChange={(event) => setLeadStatus(event.target.value)}><option value="">Tất cả giai đoạn</option>{["Đang chăm sóc", "Báo giá", "Đồng ý", "Không đáp ứng"].map((status) => <option key={status}>{status}</option>)}</select><Button onClick={() => notify(`${filteredLeads.length} khách hàng phù hợp`) }>Lọc</Button></div>
+        <div className="filters"><input aria-label="Tìm khách hàng" value={leadSearch} onChange={(event) => setLeadSearch(event.target.value)} placeholder="Tìm tên, công ty, số điện thoại" /><select aria-label="Lọc theo sales" value={leadOwner} onChange={(event) => setLeadOwner(event.target.value)}><option value="">Tất cả sales</option>{owners.map((owner) => <option key={owner}>{owner}</option>)}</select><select aria-label="Lọc theo giai đoạn" value={leadStatus} onChange={(event) => setLeadStatus(event.target.value)}><option value="">Tất cả giai đoạn</option>{["Đang chăm sóc", "Báo giá", "Đồng ý", ...stages.map((stage) => stage.title), "Không đáp ứng"].filter((status, index, all) => all.indexOf(status) === index).map((status) => <option key={status}>{status}</option>)}</select><Button onClick={() => notify(`${filteredLeads.length} khách hàng phù hợp`) }>Lọc</Button></div>
         <article className="panel table-panel"><PanelHead title="Danh sách khách hàng" subtitle={`${filteredLeads.length} bản ghi`} action={<button className="link" onClick={() => notify("Đã xuất danh sách khách hàng (mock)")}>⇩ Xuất CSV</button>} /><div className="table-wrap"><table><thead><tr><th>Khách hàng</th><th>Điện thoại</th><th>Nguồn</th><th>Sales phụ trách</th><th>Giai đoạn</th><th>Liên hệ gần nhất</th></tr></thead><tbody>{filteredLeads.map((lead) => <tr className="row-click" key={`${lead.company}-${lead.phone}`} onClick={() => setSelectedLead(lead)}><td className="company">{lead.company}<span className="secondary">{lead.name}</span></td><td>{lead.phone}</td><td>{lead.source}</td><td><Owner name={lead.owner} /></td><td><Tag tone={tagClass(lead.status)}>{lead.status}</Tag></td><td>{lead.last}</td></tr>)}</tbody></table>{!filteredLeads.length && <div className="empty-state">Không tìm thấy khách hàng phù hợp.</div>}</div></article>
       </>}
 
       {page === "pipeline" && <>
-        <PageHead eyebrow="Quản lý cơ hội" title="Pipeline đơn hàng" description="Theo dõi tiến độ từng cơ hội và người phụ trách." action={<Button primary onClick={() => setModal("deal")}>＋ Tạo cơ hội</Button>} />
-        <div className="pipeline-head"><div className="subtle">Chọn thẻ để điều chỉnh giai đoạn; từ chối báo giá sẽ đưa cơ hội về chăm sóc.</div><select aria-label="Lọc cơ hội theo sales" value={dealOwner} onChange={(event) => setDealOwner(event.target.value)}><option value="">Toàn đội</option>{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></div>
-        <div className="pipeline">{stages.slice(0, 12).map((stage) => { const stageDeals = deals.filter((deal) => deal.stage === stage && (!dealOwner || deal.owner === dealOwner)); return <section className="stage" key={stage}><div className="stage-head">{stage}<b>{stageDeals.length}</b></div>{stageDeals.length ? stageDeals.map((deal) => <article className="deal" key={deal.name}><h3>{deal.name}</h3><p>{deal.detail}</p><div className="deal-foot"><span className="amount">{money(deal.value)}</span><Avatar name={deal.owner} /></div><div className="deal-actions"><button aria-label={`Lùi ${deal.name} một giai đoạn`} onClick={() => updateDeal(deal.name, stages[Math.max(0, stages.indexOf(deal.stage) - 1)])}>←</button><button aria-label={`Tiến ${deal.name} một giai đoạn`} onClick={() => updateDeal(deal.name, stages[Math.min(stages.length - 1, stages.indexOf(deal.stage) + 1)])}>→</button>{stage === "Báo giá" && <button onClick={() => updateDeal(deal.name, "Đang chăm sóc")}>Không đồng ý</button>}</div></article>) : <div className="empty-stage">Chưa có cơ hội</div>}</section>; })}</div>
+        <PageHead eyebrow="Xử lý đơn hàng" title="Theo dõi tiến độ đơn hàng" description="Từ chăm sóc khách hàng đến giao hàng và thanh toán, theo đúng thứ tự quy trình." action={<Button primary onClick={() => setModal("deal")}>＋ Tạo đơn hàng</Button>} />
+        <div className="pipeline-head"><div className="pipeline-hint"><strong>Kéo thẻ sang cột kế tiếp</strong><span>Hoặc dùng nút mũi tên trên thẻ. Nếu khách chưa đồng ý báo giá, chọn “Từ chối báo giá” để đưa về bước chăm sóc.</span></div><select aria-label="Lọc đơn hàng theo sales" value={dealOwner} onChange={(event) => setDealOwner(event.target.value)}><option value="">Tất cả sales</option>{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></div>
+        <div className="pipeline" aria-label="Bảng tiến độ đơn hàng">
+          {stages.map((stage) => {
+            const stageDeals = deals.filter((deal) => deal.stage === stage.id && (!dealOwner || deal.owner === dealOwner));
+            return <section className={`stage ${dropStage === stage.id ? "drop-target" : ""}`} key={stage.id} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropStage(stage.id); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropStage(null); }} onDrop={(event) => dropDeal(event, stage.id)}>
+              <div className="stage-head"><div><strong>{stage.title}</strong><small>{stage.description}</small></div><b>{stageDeals.length}</b></div>
+              {stageDeals.length ? stageDeals.map((deal) => {
+                const stageIndex = stages.findIndex((item) => item.id === deal.stage);
+                return <article className={`deal ${draggedDeal === deal.name ? "is-dragging" : ""}`} key={`${deal.name}-${deal.stage}`} draggable onDragStart={(event) => startDealDrag(event, deal)} onDragEnd={() => { setDraggedDeal(null); setDropStage(null); }}>
+                  <div className="deal-title-row"><span className="drag-grip" aria-hidden="true">⠿</span><h3>{deal.name}</h3></div><p>{deal.detail}</p>
+                  {deal.quoteRejected && <Tag tone="gold">Báo giá chưa được đồng ý · chăm sóc lại</Tag>}
+                  <div className="deal-foot"><span className="amount">{deal.value ? money(deal.value) : "Chưa có báo giá"}</span><Owner name={deal.owner} /></div>
+                  <div className="deal-actions"><button aria-label={`Lùi ${deal.name} một giai đoạn`} disabled={stageIndex <= 0} onClick={() => updateDeal(deal.name, stages[Math.max(0, stageIndex - 1)].id)}>←</button><button aria-label={`Tiến ${deal.name} một giai đoạn`} disabled={stageIndex >= stages.length - 1} onClick={() => updateDeal(deal.name, stages[Math.min(stages.length - 1, stageIndex + 1)].id)}>→</button>{stage.id === "quotation" && <button onClick={() => rejectQuote(deal.name)}>Từ chối báo giá</button>}</div>
+                </article>;
+              }) : <div className="empty-stage">Thả đơn hàng vào bước này</div>}
+            </section>;
+          })}
+        </div>
       </>}
 
       {page === "reports" && <>
         <PageHead eyebrow="Phân tích hiệu suất" title="Báo cáo kinh doanh" description="Theo dõi hoạt động cá nhân và toàn đội theo kỳ." action={<Button onClick={() => notify("Đã xuất báo cáo PDF (mock)")}>⇩ Xuất báo cáo</Button>} />
-        <div className="filters report-filters"><select aria-label="Kỳ báo cáo" value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option>Tháng này</option><option>Tuần này</option><option>Hôm nay</option></select><select aria-label="Đội báo cáo" value={reportTeam} onChange={(event) => setReportTeam(event.target.value)}><option>Toàn đội</option><option>Team xuất khẩu</option><option>Team nội địa</option></select><span className="subtle">Dữ liệu mẫu · {reportTeam}</span></div>
-        <div className="report-cards"><Metric label="Thời lượng gọi" value="86.4 giờ" note="↑ 11.2% so kỳ trước" /><Metric label="Lead mới" value="42" note="↑ 8 lead so kỳ trước" /><Metric label="Đơn hoàn thành" value="38" note="↑ 6 đơn so kỳ trước" /><Metric label="Yêu cầu chưa đáp ứng" value="7" note="3 đang xử lý" /><Metric label="Thời gian phản hồi TB" value="12 phút" note="↓ cải thiện 4 phút" /><Metric label="Tỷ lệ bắt máy" value="72.8%" note="↑ 4.5% so kỳ trước" /></div>
-        <div className="report-layout"><article className="panel"><PanelHead title="Cuộc gọi & chuyển đổi" subtitle={reportPeriod === "Hôm nay" ? "Theo giờ hôm nay" : reportPeriod === "Tuần này" ? "Theo ngày trong tuần" : "Theo ngày trong tháng"} /><div className="chart">{(reportPeriod === "Hôm nay" ? ["8h", "9h", "10h", "11h", "12h", "13h", "14h"] : reportPeriod === "Tuần này" ? ["T2", "T3", "T4", "T5", "T6", "T7", "CN"] : ["01", "05", "10", "15", "20", "25", "30"]).map((label, index) => <div className="chart-col" key={label}><i style={{ height: `${[42, 69, 51, 84, 63, 94, 72][index]}%` }} /><i style={{ height: `${[25, 48, 36, 61, 47, 76, 54][index]}%` }} /><label>{label}</label></div>)}</div><div className="legend"><span><i />Cuộc gọi</span><span><i />Kết nối</span></div></article>
-          <article className="panel"><PanelHead title="Hiệu suất sales" subtitle="Tổng hợp kỳ báo cáo" /><div className="report-list">{owners.slice(0, 3).map((owner, index) => <div className="report-person" key={owner}><Avatar name={owner} /><div><strong>{owner}</strong><small>{[186, 154, 132][index]} cuộc gọi · {[12, 9, 8][index]} đơn xong</small></div><b>{[94, 87, 81][index]}%</b><div className="progress"><i style={{ width: `${[94, 87, 81][index]}%` }} /></div></div>)}</div></article></div>
-        <article className="panel unmet-panel"><PanelHead title="Yêu cầu khách hàng chưa đáp ứng" subtitle="Các dịch vụ đang cần xử lý" action={<Tag tone="gold">7 yêu cầu</Tag>} /><div className="table-wrap"><table><thead><tr><th>Khách hàng</th><th>Yêu cầu</th><th>Lý do</th><th>Sales</th><th>Trạng thái</th></tr></thead><tbody><tr><td className="company">Sakura Trading</td><td>Vận chuyển hàng lạnh tuyến Nhật</td><td>Chưa có đối tác chuyên tuyến</td><td>Anh Nguyễn</td><td><Tag tone="gold">Đang tìm đối tác</Tag></td></tr><tr><td className="company">Mekong Foods</td><td>Giao hàng trong 24h</td><td>Ngoài vùng phục vụ hiện tại</td><td>Minh Trần</td><td><Tag tone="red">Chưa đáp ứng</Tag></td></tr><tr><td className="company">Orchid Home</td><td>Bảo hiểm hàng giá trị cao</td><td>Chờ xác nhận từ đơn vị bảo hiểm</td><td>Hà Phạm</td><td><Tag tone="gold">Đang xử lý</Tag></td></tr></tbody></table></div></article>
+        <div className="filters report-filters"><select aria-label="Kỳ báo cáo" value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option>Tháng này</option><option>Tuần này</option><option>Hôm nay</option></select><select aria-label="Đội báo cáo" value={reportTeam} onChange={(event) => { setReportTeam(event.target.value); setReportOwnerFilter(""); }}><option>Toàn đội</option><option>Team xuất khẩu</option><option>Team nội địa</option></select><select aria-label="Nhân viên báo cáo" value={reportOwnerFilter} onChange={(event) => setReportOwnerFilter(event.target.value)}><option value="">Tất cả nhân viên</option>{owners.filter((owner) => reportTeam === "Toàn đội" || teams[owner] === reportTeam).map((owner) => <option key={owner}>{owner}</option>)}</select><span className="subtle">Dữ liệu mẫu</span></div>
+        <div className="report-cards"><Metric label="Tổng cuộc gọi" value={reportTotals.calls.toLocaleString("vi-VN")} note={`${(reportTotals.callMinutes / 60).toFixed(1)} giờ gọi trong kỳ`} /><Metric label="Lead mới" value={String(reportTotals.leads)} note="Được phân công cho sales" /><Metric label="Đơn hoàn tất" value={String(reportTotals.completedOrders)} note="Đã giao và thanh toán" /><Metric label="Yêu cầu chưa đáp ứng" value={`${reportTotals.unmetRequests}`} note={`Phản hồi TB ${Math.round(reportTotals.responseMinutes / Math.max(reportRows.length, 1))} phút · ${Math.round(reportTotals.messageResponseRate / Math.max(reportRows.length, 1))}% tin nhắn trong 15 phút`} /></div>
+        <div className="report-layout"><article className="panel"><PanelHead title="Cuộc gọi & kết nối" subtitle={reportPeriod === "Hôm nay" ? "Theo giờ hôm nay" : reportPeriod === "Tuần này" ? "Theo ngày trong tuần" : "Theo ngày trong tháng"} /><div className="chart">{(reportPeriod === "Hôm nay" ? ["8h", "9h", "10h", "11h", "12h", "13h", "14h"] : reportPeriod === "Tuần này" ? ["T2", "T3", "T4", "T5", "T6", "T7", "CN"] : ["01", "05", "10", "15", "20", "25", "30"]).map((label, index) => { const heights = [42, 69, 51, 84, 63, 94, 72]; const connected = heights[index] * (reportTotals.answerRate / Math.max(reportRows.length, 1)) / 100; return <div className="chart-col" key={label}><i style={{ height: `${heights[index]}%` }} /><i style={{ height: `${connected}%` }} /><label>{label}</label></div>; })}</div><div className="legend"><span><i />Cuộc gọi</span><span><i />Kết nối</span></div></article>
+          <article className="panel"><PanelHead title="Hiệu suất từng nhân viên" subtitle="Chỉ số thay đổi theo kỳ và nhân viên/đội đã chọn" /><div className="table-wrap report-table-wrap"><table className="report-table"><thead><tr><th>Sales</th><th>Cuộc gọi</th><th>Thời lượng</th><th>Lead</th><th>Đơn xong</th><th>Chưa đáp ứng</th><th>Phản hồi TB</th><th>Tin nhắn ≤15 phút</th></tr></thead><tbody>{reportRows.map((row) => <tr key={row.owner}><td className="company">{row.owner}<span className="secondary">{teams[row.owner]}</span></td><td>{row.calls}</td><td>{(row.callMinutes / 60).toFixed(1)} giờ</td><td>{row.leads}</td><td>{row.completedOrders}</td><td>{row.unmetRequests}</td><td>{row.responseMinutes} phút</td><td>{row.messageResponseRate}%</td></tr>)}</tbody></table></div></article></div>
+        <article className="panel unmet-panel"><PanelHead title="Yêu cầu khách hàng chưa đáp ứng" subtitle="Mock data theo kỳ, nhân viên và đội đã chọn" action={<Tag tone="gold">{reportTotals.unmetRequests} yêu cầu</Tag>} /><div className="table-wrap"><table><thead><tr><th>Khách hàng</th><th>Yêu cầu</th><th>Lý do</th><th>Sales</th><th>Trạng thái</th><th>Ghi nhận</th></tr></thead><tbody>{unmetRequests.filter((request) => (reportPeriod === "Tháng này" || request.period === "Hôm nay" || (reportPeriod === "Tuần này" && request.period === "Tuần này")) && (reportTeam === "Toàn đội" || teams[request.owner] === reportTeam) && (!reportOwnerFilter || request.owner === reportOwnerFilter)).map((request) => <tr key={request.customer}><td className="company">{request.customer}</td><td>{request.need}</td><td>{request.reason}</td><td>{request.owner}</td><td><Tag tone={request.status === "Chưa đáp ứng" ? "red" : "gold"}>{request.status}</Tag></td><td>{request.period}</td></tr>)}</tbody></table></div></article>
       </>}
 
       {page === "calls" && <>
@@ -191,8 +296,8 @@ export default function CrmApp() {
     {selectedLead && <><button className="scrim" aria-label="Đóng hồ sơ khách hàng" onClick={() => setSelectedLead(null)} /><aside className="drawer"><div className="drawer-top"><span className="eyebrow">Hồ sơ khách hàng</span><button className="icon-btn" aria-label="Đóng" onClick={() => setSelectedLead(null)}>✕</button></div><h2>{selectedLead.company}</h2><p>{selectedLead.name} · Khách hàng từ {selectedLead.source}</p><Tag tone={tagClass(selectedLead.status)}>{selectedLead.status}</Tag><div className="drawer-sec"><h3>Thông tin liên hệ</h3><div className="detail-grid"><div><small>Điện thoại</small><strong>{selectedLead.phone}</strong></div><div><small>Sales phụ trách</small><strong>{selectedLead.owner}</strong></div><div><small>Liên hệ gần nhất</small><strong>{selectedLead.last}</strong></div><div><small>Nhu cầu</small><strong>{selectedLead.need}</strong></div></div></div><div className="drawer-sec"><h3>Lịch sử chăm sóc</h3><div className="timeline"><Activity icon="☎" title={`Cuộc gọi · ${selectedLead.owner}`} body="Trao đổi nhu cầu vận chuyển và lịch trình." time={selectedLead.last} /><Activity icon="＋" title="Khách hàng được tạo" body={`Lead từ ${selectedLead.source} đã được phân công.`} time="Mới" /></div></div><Button primary onClick={() => { setModal("call"); setSelectedLead(null); }}>☎ Ghi nhận cuộc gọi</Button> <Button onClick={() => notify("Đã lên lịch follow-up")}>＋ Follow-up</Button></aside></>}
 
     {modal && <Modal title={modal === "lead" ? "Thêm khách hàng tiềm năng" : modal === "deal" ? "Tạo cơ hội bán hàng" : "Ghi nhận cuộc gọi"} onClose={() => setModal(null)}>
-      {modal === "lead" && <form action={addLead}><div className="form-grid"><Field label="Tên liên hệ"><input name="name" placeholder="Nguyễn Văn An" required /></Field><Field label="Công ty"><input name="company" placeholder="Công ty ABC" required /></Field><Field label="Số điện thoại"><input name="phone" placeholder="0901 234 567" required /></Field><Field label="Nguồn lead"><select name="source"><option>Tổng đài</option><option>Website</option><option>Giới thiệu</option><option>Hội chợ</option></select></Field><Field label="Sales phụ trách"><select name="owner">{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></Field><Field label="Giai đoạn"><select name="status"><option>Đang chăm sóc</option><option>Báo giá</option><option>Đồng ý</option></select></Field></div><ModalActions onCancel={() => setModal(null)} submit="Tạo khách hàng" /></form>}
-      {modal === "deal" && <form action={addDeal}><div className="form-grid"><Field label="Khách hàng / công ty" wide><input name="name" placeholder="Công ty khách hàng" required /></Field><Field label="Giá trị dự kiến (₫)"><input name="value" type="number" placeholder="25000000" required /></Field><Field label="Giai đoạn"><select name="stage">{stages.slice(0, 12).map((stage) => <option key={stage}>{stage}</option>)}</select></Field><Field label="Sales phụ trách" wide><select name="owner">{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></Field></div><ModalActions onCancel={() => setModal(null)} submit="Tạo cơ hội" /></form>}
+      {modal === "lead" && <form action={addLead}><div className="form-grid"><Field label="Tên liên hệ"><input name="name" placeholder="Nguyễn Văn An" required /></Field><Field label="Công ty"><input name="company" placeholder="Công ty ABC" required /></Field><Field label="Số điện thoại"><input name="phone" placeholder="0901 234 567" required /></Field><Field label="Nguồn lead"><select name="source"><option>Tổng đài</option><option>Website</option><option>Giới thiệu</option><option>Hội chợ</option></select></Field><Field label="Sales phụ trách"><select name="owner">{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></Field><Field label="Giai đoạn"><select name="status"><option>Đang chăm sóc</option><option>Báo giá</option><option>Đồng ý</option></select></Field><Field label="Nhu cầu" wide><input name="need" placeholder="Ví dụ: vận chuyển hàng lạnh tuyến Nhật" /></Field></div><ModalActions onCancel={() => setModal(null)} submit="Tạo khách hàng" /></form>}
+      {modal === "deal" && <form action={addDeal}><div className="form-grid"><Field label="Khách hàng / công ty" wide><input name="name" placeholder="Công ty khách hàng" required /></Field><Field label="Giá trị dự kiến (₫)"><input name="value" type="number" placeholder="25000000" required /></Field><Field label="Giai đoạn"><select name="stage">{stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.title}</option>)}</select></Field><Field label="Sales phụ trách" wide><select name="owner">{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></Field></div><ModalActions onCancel={() => setModal(null)} submit="Tạo cơ hội" /></form>}
       {modal === "call" && <form action={addCall}><div className="form-grid"><Field label="Khách hàng" wide><select name="customer">{leads.map((lead) => <option key={lead.company}>{lead.company}</option>)}</select></Field><Field label="Sales"><select name="owner">{owners.map((owner) => <option key={owner}>{owner}</option>)}</select></Field><Field label="Loại cuộc gọi"><select name="direction"><option>Đi</option><option>Đến</option></select></Field><Field label="Thời lượng (phút)"><input name="duration" type="number" defaultValue="4" min="0" /></Field><Field label="Kết quả"><select name="result"><option>Đã kết nối</option><option>Không nghe máy</option><option>Gọi lại sau</option></select></Field><Field label="Ghi chú" wide><input name="note" placeholder="Trao đổi nhu cầu vận chuyển..." /></Field></div><ModalActions onCancel={() => setModal(null)} submit="Lưu cuộc gọi" /></form>}
     </Modal>}
     <div className={`toast ${toastText ? "show" : ""}`} role="status" aria-live="polite">{toastText}</div>
